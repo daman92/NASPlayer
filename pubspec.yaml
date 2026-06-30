@@ -1,0 +1,57 @@
+name: nas_player
+description: NAS & Local Music Player with Android Auto integration
+version: 1.0.0+1
+publish_to: 'none'
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Audio playback
+  just_audio: ^0.9.40
+  audio_service: ^0.18.15
+
+  # State management
+  flutter_riverpod: ^2.5.1
+
+  # Database (SQLite — no code-gen required)
+  sqflite: ^2.3.3+1
+  path_provider: ^2.1.3
+  path: ^1.9.0
+
+  # HTTP / networking
+  dio: ^5.4.3+1
+
+  # WebView for NAS login
+  webview_flutter: ^4.8.0
+  webview_flutter_android: ^3.16.2
+
+  # File access & permissions
+  file_picker: ^8.1.2
+  permission_handler: ^11.3.1
+
+  # ID3 / audio metadata
+  metadata_god: ^0.4.1
+
+  # Secure cookie/token storage
+  flutter_secure_storage: ^9.2.2
+
+  # UI helpers
+  cached_network_image: ^3.3.1
+
+  # Utilities
+  uuid: ^4.4.0
+  collection: ^1.18.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/
