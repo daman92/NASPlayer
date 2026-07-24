@@ -15,6 +15,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <!-- Media notification on Android 13+ -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
 
     <!-- Android Auto: declare the app is a media app -->
     <uses-feature android:name="android.hardware.type.automotive" android:required="false"/>
@@ -26,7 +28,7 @@
         android:requestLegacyExternalStorage="true"
         android:usesCleartextTraffic="true">
 
-        <!-- Main Flutter activity -->
+        <!-- Main Flutter activity (extends AudioServiceActivity) -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -45,9 +47,9 @@
             </intent-filter>
         </activity>
 
-        <!-- Android Auto: MediaBrowserService for audio_service -->
+        <!-- Android Auto: MediaBrowserService provided by audio_service -->
         <service
-            android:name="com.ryanheise.audioservice.AudioServiceBackgroundTask"
+            android:name="com.ryanheise.audioservice.AudioService"
             android:exported="true"
             android:foregroundServiceType="mediaPlayback">
             <intent-filter>
@@ -60,7 +62,7 @@
             android:name="com.google.android.gms.car.application"
             android:resource="@xml/automotive_app_desc"/>
 
-        <!-- audio_service notification receiver -->
+        <!-- audio_service media button receiver -->
         <receiver android:name="com.ryanheise.audioservice.MediaButtonReceiver"
             android:exported="true">
             <intent-filter>

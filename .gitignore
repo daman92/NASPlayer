@@ -12,6 +12,7 @@ build/
 *.jks
 *.keystore
 local.properties
+android/app/src/main/java/io/flutter/plugins/
 android/.gradle/
 android/app/debug/
 android/app/profile/

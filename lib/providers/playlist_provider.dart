@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:uuid/uuid.dart';
 
@@ -5,8 +7,19 @@ import '../database/app_database.dart';
 import '../models/playlist.dart';
 import '../models/track.dart';
 import 'library_provider.dart';
+import 'nas_provider.dart';
 
 const _uuid = Uuid();
+
+/// Prefix marking a NAS path in playlist storage. NAS playlist entries store
+/// the raw NAS path (not a stream URL), so they can be re-resolved with fresh
+/// session cookies at play time.
+const nasPathPrefix = 'nas://';
+
+String playlistPathForTrack(Track t) =>
+    t.source == TrackSource.nas && t.nasPath != null
+        ? '$nasPathPrefix${t.nasPath}'
+        : t.filePath;
 
 class PlaylistNotifier extends StateNotifier<AsyncValue<List<Playlist>>> {
   final AppDatabase _db;
@@ -44,7 +57,7 @@ class PlaylistNotifier extends StateNotifier<AsyncValue<List<Playlist>>> {
     final id = _uuid.v4();
     final now = DateTime.now().millisecondsSinceEpoch;
 
-    await _db.upsertPlaylist({
+    await _db.insertPlaylist({
       'id': id,
       'name': name,
       'created_at': now,
@@ -57,7 +70,7 @@ class PlaylistNotifier extends StateNotifier<AsyncValue<List<Playlist>>> {
         tracks.asMap().entries.map((e) => {
               'playlist_id': id,
               'track_id': e.value.id,
-              'track_path': e.value.filePath,
+              'track_path': playlistPathForTrack(e.value),
               'position': e.key,
             }).toList(),
       );
@@ -68,7 +81,7 @@ class PlaylistNotifier extends StateNotifier<AsyncValue<List<Playlist>>> {
       id: id,
       name: name,
       trackIds: tracks.map((t) => t.id).toList(),
-      trackPaths: tracks.map((t) => t.filePath).toList(),
+      trackPaths: tracks.map(playlistPathForTrack).toList(),
       createdAt: DateTime.fromMillisecondsSinceEpoch(now),
       updatedAt: DateTime.fromMillisecondsSinceEpoch(now),
     );
@@ -89,7 +102,7 @@ class PlaylistNotifier extends StateNotifier<AsyncValue<List<Playlist>>> {
       ...newTracks.asMap().entries.map((e) => {
             'playlist_id': playlistId,
             'track_id': e.value.id,
-            'track_path': e.value.filePath,
+            'track_path': playlistPathForTrack(e.value),
             'position': startPos + e.key,
           }),
     ]);
@@ -100,6 +113,7 @@ class PlaylistNotifier extends StateNotifier<AsyncValue<List<Playlist>>> {
 
   Future<void> removeTrack(String playlistId, int index) async {
     final tracks = await _db.getPlaylistTracks(playlistId);
+    if (index < 0 || index >= tracks.length) return;
     final updated = List<Map<String, Object?>>.from(tracks)..removeAt(index);
 
     await _db.replacePlaylistTracks(
@@ -115,12 +129,29 @@ class PlaylistNotifier extends StateNotifier<AsyncValue<List<Playlist>>> {
     await _load();
   }
 
-  Future<void> reorderTrack(
-      String playlistId, int oldIndex, int newIndex) async {
+  /// Accepts raw ReorderableListView onReorder indices (newIndex includes
+  /// the removed slot when dragging down).
+  Future<void> reorderTrack(String playlistId, int oldIndex, int newIndex) {
+    var target = newIndex;
+    if (target > oldIndex) target -= 1;
+    return moveTrack(playlistId, oldIndex, target);
+  }
+
+  /// Move with already-adjusted indices (onReorderItem semantics).
+  Future<void> moveTrack(
+      String playlistId, int oldIndex, int target) async {
     final tracks = await _db.getPlaylistTracks(playlistId);
+    if (oldIndex < 0 ||
+        oldIndex >= tracks.length ||
+        target < 0 ||
+        target >= tracks.length ||
+        target == oldIndex) {
+      return;
+    }
+
     final list = List<Map<String, Object?>>.from(tracks);
     final item = list.removeAt(oldIndex);
-    list.insert(newIndex < oldIndex ? newIndex : newIndex - 1, item);
+    list.insert(target, item);
 
     await _db.replacePlaylistTracks(
       playlistId,
@@ -135,12 +166,8 @@ class PlaylistNotifier extends StateNotifier<AsyncValue<List<Playlist>>> {
   }
 
   Future<void> renamePlaylist(String playlistId, String newName) async {
-    final current = state.value?.firstWhere((p) => p.id == playlistId);
-    if (current == null) return;
-    await _db.upsertPlaylist({
-      'id': playlistId,
+    await _db.updatePlaylist(playlistId, {
       'name': newName,
-      'created_at': current.createdAt.millisecondsSinceEpoch,
       'updated_at': DateTime.now().millisecondsSinceEpoch,
     });
     await _load();
@@ -158,22 +185,7 @@ class PlaylistNotifier extends StateNotifier<AsyncValue<List<Playlist>>> {
   }
 
   Future<void> _touchPlaylist(String playlistId) async {
-    final current = state.value?.firstWhere(
-      (p) => p.id == playlistId,
-      orElse: () => Playlist(
-        id: playlistId,
-        name: '',
-        trackIds: [],
-        trackPaths: [],
-        createdAt: DateTime.now(),
-        updatedAt: DateTime.now(),
-      ),
-    );
-    if (current == null) return;
-    await _db.upsertPlaylist({
-      'id': playlistId,
-      'name': current.name,
-      'created_at': current.createdAt.millisecondsSinceEpoch,
+    await _db.updatePlaylist(playlistId, {
       'updated_at': DateTime.now().millisecondsSinceEpoch,
     });
   }
@@ -183,6 +195,115 @@ final playlistNotifierProvider =
     StateNotifierProvider<PlaylistNotifier, AsyncValue<List<Playlist>>>((ref) {
   return PlaylistNotifier(ref.watch(databaseProvider));
 });
+
+// ── Playlist playback resolution (design 5.3 / 7) ──────────────────────────
+
+class ResolvedPlaylist {
+  final List<Track> tracks;
+  final List<String> skipped;
+
+  /// For each entry in [tracks], its index in the ORIGINAL path list — used
+  /// to remap a tapped row index onto the resolved (shortened) list.
+  final List<int> originalIndices;
+
+  const ResolvedPlaylist(this.tracks, this.skipped, this.originalIndices);
+
+  /// Index into [tracks] for the original row [originalIndex] (the first
+  /// resolved entry at-or-after it, so taps below skipped rows stay aligned).
+  int resolveStartIndex(int originalIndex) {
+    for (var i = 0; i < originalIndices.length; i++) {
+      if (originalIndices[i] >= originalIndex) return i;
+    }
+    return tracks.isEmpty ? 0 : tracks.length - 1;
+  }
+}
+
+/// Resolve playlist paths into playable Tracks:
+/// - local paths are looked up in the library index (fallback: raw file) and
+///   verified to exist — missing files are skipped and reported (design 7);
+/// - NAS paths (`nas://...`) are re-resolved to authenticated stream URLs
+///   with the active adapter; without a session they are skipped.
+Future<ResolvedPlaylist> resolvePlaylistTracks(
+    WidgetRef ref, List<String> paths) async {
+  final db = ref.read(databaseProvider);
+  final adapter = ref.read(authenticatedNasProvider);
+
+  final lookupPaths = paths
+      .map((p) => p.startsWith(nasPathPrefix)
+          ? p.substring(nasPathPrefix.length)
+          : p)
+      .toList();
+  final rows = await db.getTracksByPaths(lookupPaths);
+  final byPath = <String, Map<String, Object?>>{
+    for (final row in rows) row['file_path'] as String: row,
+    for (final row in rows)
+      if (row['nas_path'] != null) row['nas_path'] as String: row,
+  };
+
+  final tracks = <Track>[];
+  final skipped = <String>[];
+  final originalIndices = <int>[];
+
+  for (var pathIndex = 0; pathIndex < paths.length; pathIndex++) {
+    final rawPath = paths[pathIndex];
+    final isNas = rawPath.startsWith(nasPathPrefix);
+    final path =
+        isNas ? rawPath.substring(nasPathPrefix.length) : rawPath;
+    final name = path.split(RegExp(r'[\\/]')).last;
+    final title =
+        name.contains('.') ? name.substring(0, name.lastIndexOf('.')) : name;
+
+    if (isNas) {
+      if (adapter == null) {
+        skipped.add(name);
+        continue;
+      }
+      final row = byPath[path];
+      tracks.add(Track(
+        id: row?['id'] as String? ?? path,
+        title: row?['title'] as String? ?? title,
+        artist: row?['artist'] as String? ?? 'Unknown Artist',
+        album: row?['album'] as String? ?? 'Unknown Album',
+        duration:
+            Duration(milliseconds: (row?['duration_ms'] as int?) ?? 0),
+        filePath: adapter.getStreamUrl(path),
+        nasPath: path,
+        httpHeaders: adapter.streamHeaders,
+        source: TrackSource.nas,
+        format: name.contains('.') ? name.split('.').last.toLowerCase() : '',
+      ));
+      originalIndices.add(pathIndex);
+      continue;
+    }
+
+    // Local: skip files that no longer exist (design 7). SAF content URIs
+    // (Google Drive etc.) can't be cheaply checked — assume available and
+    // let the player's error auto-skip handle outages.
+    if (!path.startsWith('content://') && !File(path).existsSync()) {
+      skipped.add(name);
+      continue;
+    }
+
+    final row = byPath[path];
+    if (row != null) {
+      tracks.add(rowToTrack(row));
+    } else {
+      tracks.add(Track(
+        id: path,
+        title: title,
+        artist: 'Unknown Artist',
+        album: 'Unknown Album',
+        duration: Duration.zero,
+        filePath: path,
+        source: TrackSource.local,
+        format: name.contains('.') ? name.split('.').last.toLowerCase() : '',
+      ));
+    }
+    originalIndices.add(pathIndex);
+  }
+
+  return ResolvedPlaylist(tracks, skipped, originalIndices);
+}
 
 // ── Multi-select state ──────────────────────────────────────────────────────
 
@@ -199,12 +320,30 @@ class SelectionNotifier extends StateNotifier<Set<String>> {
     state = s;
   }
 
+  void addAll(Iterable<String> paths) {
+    state = {...state, ...paths};
+  }
+
+  void removeAll(Iterable<String> paths) {
+    final s = Set<String>.from(state)..removeAll(paths);
+    state = s;
+  }
+
   void clear() => state = {};
 
   bool isSelected(String path) => state.contains(path);
 }
 
+/// Selection for the local Library browse surface (keys: local file paths).
 final selectionProvider =
+    StateNotifierProvider<SelectionNotifier, Set<String>>((ref) {
+  return SelectionNotifier();
+});
+
+/// Separate selection for the NAS browser (keys: NAS paths / 'dir:<path>').
+/// Keeping the two apart prevents a Library selection from leaking into the
+/// NAS toolbar and being misinterpreted as NAS paths.
+final nasSelectionProvider =
     StateNotifierProvider<SelectionNotifier, Set<String>>((ref) {
   return SelectionNotifier();
 });

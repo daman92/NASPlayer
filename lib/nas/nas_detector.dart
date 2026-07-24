@@ -1,40 +1,75 @@
 import '../models/nas_config.dart';
-import '../services/settings_service.dart';
 import 'nas_adapter.dart';
+import 'nextcloud_adapter.dart';
+import 'qnap_adapter.dart';
 import 'synology_adapter.dart';
+import 'truenas_adapter.dart';
 
+/// Detects the NAS vendor by probing known API endpoints (design doc 8.2)
+/// and builds the matching adapter. Users can override the result manually
+/// in Settings via [adapterForVendor].
 class NasDetector {
-  final SettingsService _settings;
+  const NasDetector();
 
-  NasDetector(this._settings);
+  /// Probe vendors in priority order and return the detected one, or null.
+  Future<NasVendor?> detectVendor(
+    String baseUrl,
+    String cookies, {
+    Map<String, String> extraHeaders = const {},
+  }) async {
+    final candidates = <NasAdapter>[
+      SynologyAdapter(baseUrl, cookies: cookies, extraHeaders: extraHeaders),
+      QnapAdapter(baseUrl, cookies: cookies, extraHeaders: extraHeaders),
+      NextcloudAdapter(baseUrl, cookies: cookies, extraHeaders: extraHeaders),
+      TrueNasAdapter(baseUrl, cookies: cookies, extraHeaders: extraHeaders),
+    ];
 
-  Future<NasAdapter?> createAdapter(String nasId, String baseUrl) async {
-    final cookies = await _settings.getCookiesForNas(nasId) ?? '';
-
-    // Try Synology first (Phase 1 priority)
-    final synology = SynologyAdapter(baseUrl, cookies: cookies);
-    final synologyVendor = await synology.detect();
-    if (synologyVendor != null) return synology;
-
-    // Phase 2: QNAP, Nextcloud adapters would be tried here
-
-    // Return Synology as default (most common)
-    return SynologyAdapter(baseUrl, cookies: cookies);
+    for (final adapter in candidates) {
+      final vendor = await adapter.detect();
+      if (vendor != null) return vendor;
+    }
+    return null;
   }
 
   NasAdapter adapterForVendor(
     NasVendor vendor,
     String baseUrl,
-    String cookies,
-  ) {
+    String cookies, {
+    Map<String, String> extraHeaders = const {},
+  }) {
     switch (vendor) {
+      case NasVendor.qnap:
+        return QnapAdapter(baseUrl, cookies: cookies, extraHeaders: extraHeaders);
+      case NasVendor.nextcloud:
+        return NextcloudAdapter(baseUrl,
+            cookies: cookies, extraHeaders: extraHeaders);
+      case NasVendor.truenas:
+        return TrueNasAdapter(baseUrl,
+            cookies: cookies, extraHeaders: extraHeaders);
       case NasVendor.synology:
-      case NasVendor.unknown:
       case NasVendor.generic:
-        return SynologyAdapter(baseUrl, cookies: cookies);
-      default:
-        // Phase 2: return vendor-specific adapters
-        return SynologyAdapter(baseUrl, cookies: cookies);
+      case NasVendor.unknown:
+        return SynologyAdapter(baseUrl,
+            cookies: cookies, extraHeaders: extraHeaders);
     }
+  }
+
+  /// Detect and build in one step, falling back to Synology (most common).
+  Future<({NasAdapter adapter, NasVendor? detected})> createAdapter(
+    String baseUrl,
+    String cookies, {
+    Map<String, String> extraHeaders = const {},
+  }) async {
+    final vendor =
+        await detectVendor(baseUrl, cookies, extraHeaders: extraHeaders);
+    return (
+      adapter: adapterForVendor(
+        vendor ?? NasVendor.synology,
+        baseUrl,
+        cookies,
+        extraHeaders: extraHeaders,
+      ),
+      detected: vendor,
+    );
   }
 }

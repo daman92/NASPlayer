@@ -1,4 +1,4 @@
-import 'package:file_picker/file_picker.dart';
+import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -7,6 +7,7 @@ import '../../models/track.dart';
 import '../../providers/audio_provider.dart';
 import '../../providers/library_provider.dart';
 import '../../providers/playlist_provider.dart';
+import '../widgets/add_to_playlist_sheet.dart';
 import '../widgets/track_tile.dart';
 import 'now_playing_screen.dart';
 
@@ -22,13 +23,20 @@ class LibraryScreen extends ConsumerWidget {
       appBar: AppBar(
         title: const Text('Library'),
         actions: [
-          if (currentFolder != null)
+          if (currentFolder != null) ...[
+            IconButton(
+              icon: const Icon(Icons.sort),
+              tooltip: 'Sort & filter',
+              onPressed: () => _showSortFilterSheet(context, ref),
+            ),
             IconButton(
               icon: const Icon(Icons.refresh),
               tooltip: 'Rescan folder',
-              onPressed: () =>
-                  ref.read(scanNotifierProvider.notifier).scanFolder(currentFolder),
+              onPressed: () => ref
+                  .read(scanNotifierProvider.notifier)
+                  .scanFolder(currentFolder),
             ),
+          ],
           IconButton(
             icon: const Icon(Icons.folder_open),
             tooltip: 'Open folder',
@@ -46,23 +54,100 @@ class LibraryScreen extends ConsumerWidget {
   }
 
   Future<void> _pickFolder(BuildContext context, WidgetRef ref) async {
-    final status = await Permission.audio.request();
-    if (!status.isGranted) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-              content: Text('Storage permission required to browse music')),
-        );
-      }
-      return;
-    }
+    // Needed for direct-path reads of on-device audio files.
+    await Permission.audio.request();
 
-    final result = await FilePicker.platform.getDirectoryPath();
-    if (result == null) return;
+    // System tree picker: shows device storage AND cloud providers
+    // (Google Drive, etc.) and persists the access grant.
+    final saf = ref.read(safScannerProvider);
+    final treeUri = await saf.pickTree();
+    if (treeUri == null) return;
 
-    ref.read(currentFolderProvider.notifier).state = result;
-    await ref.read(scanNotifierProvider.notifier).scanFolder(result);
+    // Device-storage trees resolve to a real path → full ID3 metadata scan.
+    // Cloud trees (no filesystem path) scan through the DocumentsProvider.
+    final folder = saf.resolveToFilesystemPath(treeUri) ?? treeUri;
+
+    ref.read(currentFolderProvider.notifier).state = folder;
+    await ref.read(scanNotifierProvider.notifier).scanFolder(folder);
   }
+
+  void _showSortFilterSheet(BuildContext context, WidgetRef ref) {
+    showModalBottomSheet(
+      context: context,
+      builder: (_) => const _SortFilterSheet(),
+    );
+  }
+}
+
+class _SortFilterSheet extends ConsumerWidget {
+  const _SortFilterSheet();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final sort = ref.watch(librarySortProvider);
+    final format = ref.watch(libraryFormatFilterProvider);
+    final groupByAlbum = ref.watch(libraryGroupByAlbumProvider);
+
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Sort by', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              children: LibrarySort.values
+                  .map((s) => ChoiceChip(
+                        label: Text(_sortLabel(s)),
+                        selected: sort == s,
+                        onSelected: (_) => ref
+                            .read(librarySortProvider.notifier)
+                            .state = s,
+                      ))
+                  .toList(),
+            ),
+            const SizedBox(height: 16),
+            Text('Format', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              children: [
+                '', 'mp3', 'flac', 'aac', 'ogg', 'wav', 'm4a', 'alac',
+                'aiff', 'opus'
+              ]
+                  .map((f) => ChoiceChip(
+                        label: Text(f.isEmpty ? 'All' : f.toUpperCase()),
+                        selected: format == f,
+                        onSelected: (_) => ref
+                            .read(libraryFormatFilterProvider.notifier)
+                            .state = f,
+                      ))
+                  .toList(),
+            ),
+            const SizedBox(height: 16),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Group by album'),
+              value: groupByAlbum,
+              onChanged: (v) =>
+                  ref.read(libraryGroupByAlbumProvider.notifier).state = v,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _sortLabel(LibrarySort s) => switch (s) {
+        LibrarySort.name => 'NAME',
+        LibrarySort.artist => 'ARTIST',
+        LibrarySort.album => 'ALBUM',
+        LibrarySort.dateModified => 'DATE',
+        LibrarySort.duration => 'LENGTH',
+      };
 }
 
 class _EmptyState extends StatelessWidget {
@@ -111,6 +196,9 @@ class _FolderView extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final tracksAsync = ref.watch(folderTracksProvider(folderPath));
     final selected = ref.watch(selectionProvider);
+    final sort = ref.watch(librarySortProvider);
+    final format = ref.watch(libraryFormatFilterProvider);
+    final groupByAlbum = ref.watch(libraryGroupByAlbumProvider);
     final isSelecting = selected.isNotEmpty;
 
     if (scanState.scanning) {
@@ -138,10 +226,18 @@ class _FolderView extends ConsumerWidget {
     return tracksAsync.when(
       loading: () => const Center(child: CircularProgressIndicator()),
       error: (e, _) => Center(child: Text('Error: $e')),
-      data: (tracks) {
-        if (tracks.isEmpty) {
+      data: (allTracks) {
+        if (allTracks.isEmpty) {
           return const Center(child: Text('No audio files found'));
         }
+
+        var tracks = allTracks;
+        if (format.isNotEmpty) {
+          tracks = tracks
+              .where((t) => t.format.toLowerCase() == format)
+              .toList();
+        }
+        tracks = _applySort(tracks, sort);
 
         return Column(
           children: [
@@ -156,14 +252,17 @@ class _FolderView extends ConsumerWidget {
               child: Row(
                 children: [
                   Text(
-                    '${tracks.length} tracks',
+                    format.isEmpty
+                        ? '${tracks.length} tracks'
+                        : '${tracks.length} ${format.toUpperCase()} tracks',
                     style: Theme.of(context).textTheme.bodySmall,
                   ),
                   const Spacer(),
                   TextButton.icon(
                     icon: const Icon(Icons.shuffle, size: 16),
                     label: const Text('Shuffle All'),
-                    onPressed: () => _playAll(context, ref, tracks, shuffle: true),
+                    onPressed: () =>
+                        _playAll(context, ref, tracks, shuffle: true),
                   ),
                   TextButton.icon(
                     icon: const Icon(Icons.play_arrow, size: 16),
@@ -174,35 +273,63 @@ class _FolderView extends ConsumerWidget {
               ),
             ),
             Expanded(
-              child: ListView.builder(
-                itemCount: tracks.length,
-                itemBuilder: (context, index) {
-                  final track = tracks[index];
-                  return TrackTile(
-                    track: track,
-                    isSelected: selected.contains(track.filePath),
-                    isSelecting: isSelecting,
-                    position: index + 1,
-                    total: tracks.length,
-                    onTap: () {
-                      if (isSelecting) {
-                        ref
-                            .read(selectionProvider.notifier)
-                            .toggle(track.filePath);
-                      } else {
-                        _playFrom(context, ref, tracks, index);
-                      }
-                    },
-                    onLongPress: () =>
-                        ref.read(selectionProvider.notifier).toggle(track.filePath),
-                  );
-                },
-              ),
+              child: groupByAlbum
+                  ? _AlbumGroupedList(
+                      tracks: tracks,
+                      isSelecting: isSelecting,
+                      selected: selected,
+                    )
+                  : ListView.builder(
+                      itemCount: tracks.length,
+                      itemBuilder: (context, index) {
+                        final track = tracks[index];
+                        return TrackTile(
+                          track: track,
+                          isSelected: selected.contains(track.filePath),
+                          isSelecting: isSelecting,
+                          position: index + 1,
+                          total: tracks.length,
+                          onTap: () {
+                            if (isSelecting) {
+                              ref
+                                  .read(selectionProvider.notifier)
+                                  .toggle(track.filePath);
+                            } else {
+                              _playFrom(context, ref, tracks, index);
+                            }
+                          },
+                          onLongPress: () => ref
+                              .read(selectionProvider.notifier)
+                              .toggle(track.filePath),
+                        );
+                      },
+                    ),
             ),
           ],
         );
       },
     );
+  }
+
+  List<Track> _applySort(List<Track> tracks, LibrarySort sort) {
+    final list = List<Track>.from(tracks);
+    switch (sort) {
+      case LibrarySort.name:
+        list.sort((a, b) =>
+            a.title.toLowerCase().compareTo(b.title.toLowerCase()));
+      case LibrarySort.artist:
+        list.sort((a, b) =>
+            a.artist.toLowerCase().compareTo(b.artist.toLowerCase()));
+      case LibrarySort.album:
+        list.sort(
+            (a, b) => a.album.toLowerCase().compareTo(b.album.toLowerCase()));
+      case LibrarySort.dateModified:
+        list.sort((a, b) => (b.dateModified ?? DateTime(0))
+            .compareTo(a.dateModified ?? DateTime(0)));
+      case LibrarySort.duration:
+        list.sort((a, b) => a.duration.compareTo(b.duration));
+    }
+    return list;
   }
 
   void _playAll(BuildContext context, WidgetRef ref, List<Track> tracks,
@@ -229,6 +356,66 @@ class _FolderView extends ConsumerWidget {
   }
 }
 
+/// Album-grouped library view (design 6.1: album used for grouping).
+class _AlbumGroupedList extends ConsumerWidget {
+  final List<Track> tracks;
+  final bool isSelecting;
+  final Set<String> selected;
+
+  const _AlbumGroupedList({
+    required this.tracks,
+    required this.isSelecting,
+    required this.selected,
+  });
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final groups = groupBy(tracks, (Track t) => t.album);
+    final albums = groups.keys.sorted(
+        (a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+
+    return ListView.builder(
+      itemCount: albums.length,
+      itemBuilder: (context, index) {
+        final album = albums[index];
+        final albumTracks = groups[album]!;
+        return ExpansionTile(
+          leading: const Icon(Icons.album),
+          title: Text(album, maxLines: 1, overflow: TextOverflow.ellipsis),
+          subtitle: Text(
+              '${albumTracks.first.artist} — ${albumTracks.length} tracks',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis),
+          children: albumTracks
+              .mapIndexed((i, track) => TrackTile(
+                    track: track,
+                    isSelected: selected.contains(track.filePath),
+                    isSelecting: isSelecting,
+                    position: i + 1,
+                    onTap: () {
+                      if (isSelecting) {
+                        ref
+                            .read(selectionProvider.notifier)
+                            .toggle(track.filePath);
+                      } else {
+                        ref
+                            .read(queueNotifierProvider.notifier)
+                            .playTracks(albumTracks, startIndex: i);
+                        Navigator.of(context).push(MaterialPageRoute(
+                            builder: (_) => const NowPlayingScreen()));
+                      }
+                    },
+                    onLongPress: () => ref
+                        .read(selectionProvider.notifier)
+                        .toggle(track.filePath),
+                  ))
+              .toList(),
+        );
+      },
+    );
+  }
+}
+
 class _SelectionToolbar extends ConsumerWidget {
   final int selectedCount;
   final List<Track> allTracks;
@@ -243,7 +430,7 @@ class _SelectionToolbar extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     return Container(
-      color: Theme.of(context).colorScheme.primary.withOpacity(0.12),
+      color: Theme.of(context).colorScheme.primary.withValues(alpha: 0.12),
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       child: Row(
         children: [
@@ -263,104 +450,8 @@ class _SelectionToolbar extends ConsumerWidget {
 
   void _addToPlaylist(BuildContext context, WidgetRef ref) {
     final selected = ref.read(selectionProvider);
-    final tracks = allTracks.where((t) => selected.contains(t.filePath)).toList();
-    showModalBottomSheet(
-      context: context,
-      builder: (_) => _AddToPlaylistSheet(tracks: tracks, onDone: onClear),
-    );
-  }
-}
-
-class _AddToPlaylistSheet extends ConsumerWidget {
-  final List<Track> tracks;
-  final VoidCallback onDone;
-
-  const _AddToPlaylistSheet({required this.tracks, required this.onDone});
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final playlistsAsync = ref.watch(playlistNotifierProvider);
-
-    return SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('Add ${tracks.length} tracks to...',
-                style: Theme.of(context).textTheme.titleMedium),
-            const SizedBox(height: 8),
-            ListTile(
-              leading: const Icon(Icons.add_circle_outline),
-              title: const Text('New Playlist'),
-              onTap: () async {
-                Navigator.pop(context);
-                final name = await _promptName(context);
-                if (name != null && name.isNotEmpty) {
-                  await ref
-                      .read(playlistNotifierProvider.notifier)
-                      .createPlaylist(name, tracks);
-                  onDone();
-                }
-              },
-            ),
-            const Divider(),
-            playlistsAsync.when(
-              loading: () => const CircularProgressIndicator(),
-              error: (e, _) => Text('Error: $e'),
-              data: (playlists) => Column(
-                children: playlists
-                    .map((p) => ListTile(
-                          leading: const Icon(Icons.queue_music),
-                          title: Text(p.name),
-                          subtitle: Text('${p.trackCount} tracks'),
-                          onTap: () async {
-                            Navigator.pop(context);
-                            await ref
-                                .read(playlistNotifierProvider.notifier)
-                                .addTracksToPlaylist(p.id, tracks);
-                            onDone();
-                            if (context.mounted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(
-                                    content: Text(
-                                        'Added ${tracks.length} tracks to ${p.name}')),
-                              );
-                            }
-                          },
-                        ))
-                    .toList(),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Future<String?> _promptName(BuildContext context) async {
-    final controller = TextEditingController();
-    return showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('New Playlist'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          decoration: const InputDecoration(hintText: 'Playlist name'),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, controller.text),
-            child: const Text('Create'),
-          ),
-        ],
-      ),
-    );
+    final tracks =
+        allTracks.where((t) => selected.contains(t.filePath)).toList();
+    AddToPlaylistSheet.show(context, tracks, onDone: onClear);
   }
 }

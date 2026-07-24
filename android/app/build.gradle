@@ -1,6 +1,6 @@
 plugins {
     id "com.android.application"
-    id "kotlin-android"
+    id "org.jetbrains.kotlin.android"
     id "dev.flutter.flutter-gradle-plugin"
 }
 
@@ -20,7 +20,7 @@ if (flutterVersionName == null) flutterVersionName = '1.0'
 
 android {
     namespace "com.example.nas_player"
-    compileSdk 34
+    compileSdk 36
     ndkVersion flutter.ndkVersion
 
     compileOptions {
@@ -37,9 +37,10 @@ android {
     }
 
     defaultConfig {
-        applicationId "com.example.nas_player"
+        // Play Store rejects com.example.* ids — set before first release.
+        applicationId "com.nasplayer.app"
         minSdk 26
-        targetSdk 34
+        targetSdk 36
         versionCode flutterVersionCode.toInteger()
         versionName flutterVersionName
         multiDexEnabled true
@@ -47,6 +48,8 @@ android {
 
     buildTypes {
         release {
+            // TODO: replace with a real release keystore before publishing —
+            // Play rejects debug-signed artifacts (key.properties pattern).
             signingConfig signingConfigs.debug
             minifyEnabled false
             shrinkResources false
@@ -59,7 +62,6 @@ flutter {
 }
 
 dependencies {
-    implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:$kotlin_version"
     implementation 'androidx.multidex:multidex:2.0.1'
     // Android Auto
     implementation 'androidx.media:media:1.7.0'

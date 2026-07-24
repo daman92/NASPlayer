@@ -3,7 +3,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../providers/audio_provider.dart';
-import '../screens/now_playing_screen.dart';
 
 class PlaybackControls extends ConsumerWidget {
   final bool large;

@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../providers/audio_provider.dart';
-import '../../utils/format_utils.dart';
 import '../screens/now_playing_screen.dart';
 import 'album_art.dart';
 
@@ -56,7 +55,10 @@ class MiniPlayer extends ConsumerWidget {
                   SizedBox(
                     width: 44,
                     height: 44,
-                    child: AlbumArt(artUri: mediaItem.artUri, size: 44),
+                    child: AlbumArt(
+                        artUri: mediaItem.artUri,
+                        size: 44,
+                        animate: isPlaying),
                   ),
                   const SizedBox(width: 12),
                   // Track info

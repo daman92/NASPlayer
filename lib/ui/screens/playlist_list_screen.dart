@@ -2,9 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../models/playlist.dart';
-import '../../models/track.dart';
 import '../../providers/audio_provider.dart';
-import '../../providers/library_provider.dart';
 import '../../providers/playlist_provider.dart';
 import '../widgets/album_art.dart';
 import 'now_playing_screen.dart';
@@ -115,11 +113,36 @@ class PlaylistDetailScreen extends ConsumerWidget {
         actions: [
           IconButton(
             icon: const Icon(Icons.edit),
+            tooltip: 'Rename',
             onPressed: () => _rename(context, ref, p),
           ),
-          IconButton(
-            icon: const Icon(Icons.delete_outline),
-            onPressed: () => _delete(context, ref, p),
+          PopupMenuButton<String>(
+            onSelected: (action) {
+              switch (action) {
+                case 'clear':
+                  _clear(context, ref, p);
+                case 'delete':
+                  _delete(context, ref, p);
+              }
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(
+                value: 'clear',
+                child: ListTile(
+                  leading: Icon(Icons.clear_all),
+                  title: Text('Clear all tracks'),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+              PopupMenuItem(
+                value: 'delete',
+                child: ListTile(
+                  leading: Icon(Icons.delete_outline),
+                  title: Text('Delete playlist'),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+            ],
           ),
         ],
       ),
@@ -151,20 +174,28 @@ class PlaylistDetailScreen extends ConsumerWidget {
                 Expanded(
                   child: ReorderableListView.builder(
                     itemCount: p.trackPaths.length,
-                    onReorder: (oldIndex, newIndex) {
+                    onReorderItem: (oldIndex, newIndex) {
                       ref
                           .read(playlistNotifierProvider.notifier)
-                          .reorderTrack(p.id, oldIndex, newIndex);
+                          .moveTrack(p.id, oldIndex, newIndex);
                     },
                     itemBuilder: (_, index) {
                       final path = p.trackPaths[index];
-                      final name = path.split(RegExp(r'[\\/]')).last;
+                      final isNas = path.startsWith(nasPathPrefix);
+                      final displayPath =
+                          isNas ? path.substring(nasPathPrefix.length) : path;
+                      final name = displayPath.split(RegExp(r'[\\/]')).last;
                       final title = name.contains('.')
                           ? name.substring(0, name.lastIndexOf('.'))
                           : name;
 
                       return Dismissible(
-                        key: ValueKey('$index-$path'),
+                        // Keyed on updatedAt too: after a removal, a duplicate
+                        // of the dismissed track shifting into this index must
+                        // get a FRESH key or Flutter reuses the dismissed
+                        // state and throws.
+                        key: ValueKey(
+                            'pl-${p.id}-${p.updatedAt.millisecondsSinceEpoch}-$index-$path'),
                         direction: DismissDirection.endToStart,
                         background: Container(
                           color: Colors.red,
@@ -178,13 +209,17 @@ class PlaylistDetailScreen extends ConsumerWidget {
                               .removeTrack(p.id, index);
                         },
                         child: ListTile(
-                          key: ValueKey(path),
                           leading: Text('${index + 1}',
                               style: Theme.of(context).textTheme.bodySmall),
                           title: Text(title,
                               maxLines: 1, overflow: TextOverflow.ellipsis),
+                          subtitle: isNas
+                              ? const Text('NAS',
+                                  style: TextStyle(fontSize: 11))
+                              : null,
                           trailing: const Icon(Icons.drag_handle),
-                          onTap: () => _playPlaylist(context, ref, p),
+                          onTap: () => _playPlaylist(context, ref, p,
+                              startIndex: index),
                         ),
                       );
                     },
@@ -195,50 +230,47 @@ class PlaylistDetailScreen extends ConsumerWidget {
     );
   }
 
+  /// Resolve paths to playable tracks; missing/unavailable files are skipped
+  /// with a notification (design 5.3 / section 7).
   Future<void> _playPlaylist(BuildContext context, WidgetRef ref, Playlist p,
-      {bool shuffle = false}) async {
-    final db = ref.read(databaseProvider);
-    final tracks = <Track>[];
+      {bool shuffle = false, int startIndex = 0}) async {
+    final resolved = await resolvePlaylistTracks(ref, p.trackPaths);
 
-    for (final path in p.trackPaths) {
-      final folderPath = path.contains('/')
-          ? path.substring(0, path.lastIndexOf('/') + 1)
-          : path.contains('\\')
-              ? path.substring(0, path.lastIndexOf('\\') + 1)
-              : '';
-
-      final rows = await db.getTracksForFolder(folderPath);
-      final row = rows.where((r) => r['file_path'] == path).firstOrNull;
-      if (row != null) {
-        tracks.add(Track(
-          id: row['id'] as String,
-          title: row['title'] as String,
-          artist: row['artist'] as String? ?? 'Unknown Artist',
-          album: row['album'] as String? ?? 'Unknown Album',
-          duration: Duration(milliseconds: (row['duration_ms'] as int?) ?? 0),
-          filePath: row['file_path'] as String,
-          source: TrackSource.local,
-          format: row['format'] as String? ?? '',
-        ));
-      } else {
-        final name = path.split(RegExp(r'[\\/]')).last;
-        tracks.add(Track(
-          id: path,
-          title: name.contains('.')
-              ? name.substring(0, name.lastIndexOf('.'))
-              : name,
-          artist: 'Unknown Artist',
-          album: 'Unknown Album',
-          duration: Duration.zero,
-          filePath: path,
-          source: TrackSource.local,
-        ));
-      }
+    if (context.mounted && resolved.skipped.isNotEmpty) {
+      final names = resolved.skipped.take(3).join(', ');
+      final more = resolved.skipped.length > 3
+          ? ' and ${resolved.skipped.length - 3} more'
+          : '';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+              'Skipped ${resolved.skipped.length} unavailable track${resolved.skipped.length == 1 ? '' : 's'}: $names$more'),
+          duration: const Duration(seconds: 5),
+        ),
+      );
     }
 
-    final list = shuffle ? (List<Track>.from(tracks)..shuffle()) : tracks;
-    if (list.isEmpty) return;
-    await ref.read(queueNotifierProvider.notifier).playTracks(list);
+    var tracks = resolved.tracks;
+    if (tracks.isEmpty) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No playable tracks in this playlist')),
+        );
+      }
+      return;
+    }
+
+    // Remap the tapped row's ORIGINAL index onto the resolved list, which
+    // may be shorter when unavailable entries were skipped.
+    var effectiveStart = resolved.resolveStartIndex(startIndex);
+    if (shuffle) {
+      tracks = List.from(tracks)..shuffle();
+      effectiveStart = 0;
+    }
+
+    await ref
+        .read(queueNotifierProvider.notifier)
+        .playTracks(tracks, startIndex: effectiveStart);
     if (context.mounted) {
       Navigator.of(context).push(
           MaterialPageRoute(builder: (_) => const NowPlayingScreen()));
@@ -270,6 +302,32 @@ class PlaylistDetailScreen extends ConsumerWidget {
       await ref
           .read(playlistNotifierProvider.notifier)
           .renamePlaylist(p.id, newName);
+    }
+  }
+
+  /// Design 5.2: clear entire playlist in one action, with confirmation.
+  void _clear(BuildContext context, WidgetRef ref, Playlist p) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Clear Playlist'),
+        content: Text(
+            'Remove all ${p.trackCount} tracks from "${p.name}"? The playlist itself is kept.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          FilledButton(
+            style: FilledButton.styleFrom(
+                backgroundColor: Theme.of(context).colorScheme.error),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Clear'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      await ref.read(playlistNotifierProvider.notifier).clearPlaylist(p.id);
     }
   }
 

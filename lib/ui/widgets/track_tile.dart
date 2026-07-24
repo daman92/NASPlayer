@@ -33,7 +33,7 @@ class TrackTile extends StatelessWidget {
     return AnimatedContainer(
       duration: const Duration(milliseconds: 150),
       color: isSelected
-          ? theme.colorScheme.primary.withOpacity(0.15)
+          ? theme.colorScheme.primary.withValues(alpha: 0.15)
           : Colors.transparent,
       child: ListTile(
         leading: isSelecting
@@ -61,7 +61,7 @@ class TrackTile extends StatelessWidget {
                 child: isCurrent
                     ? CircleAvatar(
                         backgroundColor:
-                            theme.colorScheme.primary.withOpacity(0.15),
+                            theme.colorScheme.primary.withValues(alpha: 0.15),
                         child: Icon(Icons.equalizer,
                             color: theme.colorScheme.primary, size: 20),
                       )

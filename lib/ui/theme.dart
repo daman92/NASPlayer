@@ -33,12 +33,12 @@ class AppTheme {
         ),
         navigationBarTheme: NavigationBarThemeData(
           backgroundColor: surface,
-          indicatorColor: primary.withOpacity(0.2),
+          indicatorColor: primary.withValues(alpha: 0.2),
           labelTextStyle: WidgetStateProperty.all(
             const TextStyle(fontSize: 12, color: onSurface),
           ),
         ),
-        cardTheme: CardTheme(
+        cardTheme: CardThemeData(
           color: surface,
           elevation: 0,
           shape: RoundedRectangleBorder(
